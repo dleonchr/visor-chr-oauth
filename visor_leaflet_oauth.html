@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Visor Territorial CHR · Leaflet + AGOL OAuth</title>
+
+<!-- Leaflet -->
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css" />
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
+
+<!-- esri-leaflet: conecta Leaflet con FeatureServers de ArcGIS -->
+<script src="https://unpkg.com/esri-leaflet@3.0.12/dist/esri-leaflet.js"></script>
+
+<!-- arcgis-rest-js: maneja el flujo OAuth2 contra el portal -->
+<script src="https://cdn.jsdelivr.net/npm/@esri/arcgis-rest-request@4.4.2/dist/bundled/request.umd.js"></script>
+
+<style>
+  :root{
+    --bg:#111310; --panel:#1a1d18; --stroke:#31362b; --ink:#f3f5ef;
+    --muted:#9ba295; --lime:#c9f24a; --ok:#4fc58a; --warn:#e9b84b; --crit:#e5654b;
+    --font:"Inter",-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;font-family:var(--font);background:var(--bg);color:var(--ink)}
+  #app{display:flex;flex-direction:column;height:100%}
+
+  /* ===== Barra superior ===== */
+  #topbar{
+    display:flex;align-items:center;justify-content:space-between;
+    padding:12px 18px;background:var(--panel);border-bottom:1px solid var(--stroke);
+    flex:none;z-index:10;
+  }
+  #topbar .title{font-size:14px;font-weight:800;letter-spacing:.02em}
+  #topbar .title span{color:var(--lime)}
+  #authArea{display:flex;align-items:center;gap:10px}
+  #userLabel{font-size:12.5px;color:var(--muted)}
+  #userLabel b{color:var(--ink)}
+  button{
+    font-family:var(--font);font-size:12.5px;font-weight:700;letter-spacing:.02em;
+    border-radius:8px;padding:8px 14px;border:1px solid var(--stroke);cursor:pointer;
+    background:var(--panel);color:var(--ink);transition:.15s;
+  }
+  button.primary{background:var(--lime);color:#0d0f0b;border-color:var(--lime)}
+  button:hover{filter:brightness(1.1)}
+  button:disabled{opacity:.5;cursor:not-allowed}
+
+  /* ===== Estado / mensajes ===== */
+  #statusBar{
+    padding:8px 18px;font-size:12px;color:var(--muted);background:#151812;
+    border-bottom:1px solid var(--stroke);flex:none;
+  }
+  #statusBar.error{color:var(--crit)}
+  #statusBar.ok{color:var(--ok)}
+
+  /* ===== Mapa ===== */
+  #map{flex:1;background:#0c0e0a}
+
+  /* Popup de Leaflet con identidad CHR */
+  .leaflet-popup-content-wrapper{
+    background:var(--panel);color:var(--ink);border:1px solid var(--stroke);
+    border-radius:10px;font-family:var(--font);
+  }
+  .leaflet-popup-tip{background:var(--panel)}
+  .popup-title{font-weight:800;font-size:13px;margin-bottom:4px}
+  .popup-row{font-size:12px;color:var(--muted);display:flex;justify-content:space-between;gap:10px;margin-top:2px}
+  .popup-row b{color:var(--ink);font-weight:700}
+  .badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:10.5px;font-weight:800;text-transform:uppercase}
+</style>
+</head>
+<body>
+<div id="app">
+
+  <div id="topbar">
+    <div class="title">CHR · CHILE REGISTROS <span>Visor Territorial</span></div>
+    <div id="authArea">
+      <span id="userLabel"></span>
+      <button id="btnLogin" class="primary">Iniciar sesión</button>
+      <button id="btnLogout" style="display:none">Cerrar sesión</button>
+    </div>
+  </div>
+
+  <div id="statusBar">Sin autenticar · el mapa cargará la capa una vez inicies sesión.</div>
+
+  <div id="map"></div>
+
+</div>
+
+<script>
+/* =========================================================================
+   CONFIGURACIÓN — editar antes de usar
+   ========================================================================= */
+const CONFIG = {
+  // Portal de la organización (sin barra final)
+  PORTAL_URL: "https://chrchile.maps.arcgis.com",
+
+  // Client ID de la Application (item OAuth) ya registrada en el portal
+  CLIENT_ID: "REEMPLAZAR_CON_TU_CLIENT_ID",
+
+  // URL exacta donde este archivo quedará alojado.
+  // DEBE coincidir carácter por carácter con un Redirect URI
+  // registrado en la configuración de la Application en AGOL.
+  REDIRECT_URI: "https://TU-DOMINIO/ruta/visor_leaflet_oauth.html",
+
+  // Servicio REST de ejemplo (puede tener múltiples capas: FeatureServer/0, /1, etc.)
+  FEATURE_SERVICE_URL: "https://services6.arcgis.com/l4PU7xmDHRKXMp04/arcgis/rest/services/ACTUALIZACION_CAPAS/FeatureServer",
+
+  // Índice(s) de capa dentro del FeatureServer a cargar.
+  // Ajustar una vez confirmemos qué capa(s) corresponden al estado de aprovechamiento.
+  LAYER_INDEX: 0,
+
+  // Centro y zoom inicial del mapa (aprox. norte de Chile / María Elena)
+  MAP_CENTER: [-22.34, -69.65],
+  MAP_ZOOM: 9,
+
+  // Campo de estado y paleta semáforo (ajustar al nombre real del campo en tu capa)
+  STATE_FIELD: "ESTADO_APROVECHAMIENTO",
+  STATE_COLORS: {
+    "UTILIZABLE": "#4fc58a",
+    "COMPLEJA": "#e9b84b",
+    "INHABILITADA": "#e5654b"
+  }
+};
+/* ========================================================================= */
+
+const statusBar = document.getElementById("statusBar");
+const btnLogin = document.getElementById("btnLogin");
+const btnLogout = document.getElementById("btnLogout");
+const userLabel = document.getElementById("userLabel");
+
+function setStatus(msg, kind){
+  statusBar.textContent = msg;
+  statusBar.className = kind || "";
+}
+
+// ---- Mapa base (independiente del login, siempre visible) ----
+const map = L.map("map", { zoomControl: true }).setView(CONFIG.MAP_CENTER, CONFIG.MAP_ZOOM);
+L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", {
+  attribution: "&copy; OpenStreetMap &copy; CARTO",
+  maxZoom: 19
+}).addTo(map);
+
+let featureLayer = null;
+let session = null; // ArcGISIdentityManager activo
+
+// ---- Intentar completar el flujo OAuth si venimos de un redirect/popup ----
+// (arcgisRest = objeto global expuesto por el bundle UMD de @esri/arcgis-rest-request)
+const { ArcGISIdentityManager } = arcgisRest;
+
+async function tryRestoreSession(){
+  // 1) Si esta ventana ES el popup de callback, completeOAuth2 lo maneja y se cierra sola.
+  try{
+    const completed = await ArcGISIdentityManager.completeOAuth2({
+      clientId: CONFIG.CLIENT_ID,
+      portal: CONFIG.PORTAL_URL + "/sharing/rest"
+    });
+    if (completed) return completed; // esta ventana era el popup; normalmente ya se cerró
+  }catch(e){ /* no había callback pendiente, seguimos */ }
+
+  // 2) Intentar recuperar sesión guardada en sessionStorage (persistencia entre recargas)
+  try{
+    const cached = ArcGISIdentityManager.deserialize(sessionStorage.getItem("chr_session"));
+    if (cached && cached.token) return cached;
+  }catch(e){ /* nada guardado */ }
+
+  return null;
+}
+
+function onAuthenticated(mgr){
+  session = mgr;
+  sessionStorage.setItem("chr_session", session.serialize());
+  btnLogin.style.display = "none";
+  btnLogout.style.display = "inline-block";
+  userLabel.innerHTML = "Conectado como <b>" + (session.username || "usuario") + "</b>";
+  setStatus("Autenticado. Cargando capa desde el servicio…", "ok");
+  loadFeatureLayer();
+}
+
+function onLoggedOut(){
+  session = null;
+  sessionStorage.removeItem("chr_session");
+  btnLogin.style.display = "inline-block";
+  btnLogout.style.display = "none";
+  userLabel.textContent = "";
+  if (featureLayer){ map.removeLayer(featureLayer); featureLayer = null; }
+  setStatus("Sesión cerrada. Inicia sesión para ver la capa.", "");
+}
+
+function styleByState(feature){
+  const val = feature?.properties?.[CONFIG.STATE_FIELD];
+  const color = CONFIG.STATE_COLORS[val] || "#9ba295";
+  return { color: color, weight: 1.4, fillColor: color, fillOpacity: 0.35 };
+}
+
+function bindFeaturePopup(feature, layer){
+  const p = feature.properties || {};
+  const estado = p[CONFIG.STATE_FIELD] || "SIN CLASIFICAR";
+  const color = CONFIG.STATE_COLORS[estado] || "#9ba295";
+  layer.bindPopup(
+    '<div class="popup-title">' + (p.NOMBRE || p.ID || "Predio") + '</div>' +
+    '<div class="popup-row"><span>Estado</span>' +
+      '<span class="badge" style="background:' + color + '22;color:' + color + '">' + estado + '</span>' +
+    '</div>' +
+    '<div class="popup-row"><span>Hectáreas</span><b>' + (p.HECTAREAS ?? "s/d") + '</b></div>'
+  );
+}
+
+function loadFeatureLayer(){
+  if (featureLayer) map.removeLayer(featureLayer);
+
+  const url = CONFIG.FEATURE_SERVICE_URL + "/" + CONFIG.LAYER_INDEX;
+
+  featureLayer = L.esri.featureLayer({
+    url: url,
+    token: session.token,     // <-- el token OAuth autoriza la consulta al servicio protegido
+    style: styleByState,
+    onEachFeature: bindFeaturePopup
+  });
+
+  featureLayer.on("load", function(){
+    setStatus("Capa cargada correctamente desde " + url, "ok");
+    try{ map.fitBounds(featureLayer.getBounds()); }catch(e){}
+  });
+
+  featureLayer.on("requesterror", function(e){
+    setStatus("Error consultando el servicio (¿token vencido o sin permisos?): " +
+      (e?.error?.message || "ver consola"), "error");
+    console.error("Feature layer request error:", e);
+  });
+
+  featureLayer.addTo(map);
+}
+
+// ---- Botones ----
+btnLogin.addEventListener("click", async function(){
+  setStatus("Abriendo ventana de inicio de sesión…", "");
+  try{
+    const mgr = await ArcGISIdentityManager.beginOAuth2({
+      clientId: CONFIG.CLIENT_ID,
+      redirectUri: CONFIG.REDIRECT_URI,
+      portal: CONFIG.PORTAL_URL + "/sharing/rest",
+      popup: true,
+      popupWindowFeatures: "height=520,width=480,menubar=no,location=yes,resizable=yes,scrollbars=yes,status=yes"
+    });
+    onAuthenticated(mgr);
+  }catch(err){
+    console.error(err);
+    setStatus("No se pudo completar el login (revisa Redirect URI / bloqueo de popups del navegador).", "error");
+  }
+});
+
+btnLogout.addEventListener("click", onLoggedOut);
+
+// ---- Arranque ----
+(async function init(){
+  const restored = await tryRestoreSession();
+  if (restored){
+    onAuthenticated(restored);
+  } else {
+    setStatus("Sin autenticar · el mapa cargará la capa una vez inicies sesión.", "");
+  }
+})();
+</script>
+</body>
+</html>
